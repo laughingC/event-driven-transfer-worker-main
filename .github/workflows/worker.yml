@@ -47,13 +47,38 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: docker build
-        run: docker build -t transfer-worker:${{ github.sha }} .
+      - name: aws oidc login
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ap-southeast-2
+
+      - name: login to ecr
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: create ecr repo if missing
+        run: |
+          aws ecr describe-repositories --repository-names transfer-worker 2>/dev/null || \
+          aws ecr create-repository --repository-name transfer-worker \
+            --image-scanning-configuration scanOnPush=true \
+            --encryption-configuration encryptionType=AES256
+
+      - name: docker build and push to ecr
+        env:
+          ECR_REGISTRY: ${{ steps.ecr.outputs.registry }}
+        run: |
+          IMAGE=$ECR_REGISTRY/transfer-worker
+          docker build -t $IMAGE:${{ github.sha }} -t $IMAGE:latest .
+          docker push $IMAGE:${{ github.sha }}
+          docker push $IMAGE:latest
+          echo "Pushed $IMAGE:${{ github.sha }}"
+          echo "Pushed $IMAGE:latest"
 
       - name: trivy container scan
         uses: aquasecurity/trivy-action@master
         with:
-          image-ref: transfer-worker:${{ github.sha }}
+          image-ref: ${{ steps.ecr.outputs.registry }}/transfer-worker:${{ github.sha }}
           format: table
           severity: CRITICAL,HIGH
           exit-code: 0
