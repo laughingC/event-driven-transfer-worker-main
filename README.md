@@ -1,47 +1,49 @@
 # Cross-Cloud Transfer Worker
 
-Python worker that moves files from AWS S3 to GCP GCS. Auth is done through Workload Identity Federation -- no static keys anywhere.
+Picks up files from S3 and drops them into GCS. Built this for the Megt case study to show a working cross-cloud pipeline with proper auth (no static keys, everything goes through OIDC/WIF).
 
-This runs against real free-tier AWS and GCP accounts via GitHub Actions. Each workflow run seeds a timestamped file in S3, transfers it to GCS, then runs again to prove the idempotency check works.
+The whole thing runs on GitHub Actions against my free-tier AWS and GCP accounts. Each run creates timestamped files so you can see the history building up in both consoles.
 
-## How to run
+## Running it
 
 ```bash
 pip install -r requirements.txt
+python -m pytest tests/ -v          # 16 tests, all mocked, no creds needed
 
-# tests (no cloud creds needed)
-python -m pytest tests/ -v
-
-# single-event transfer (env vars)
-export SOURCE_BUCKET=your-s3-bucket  SOURCE_KEY=incoming/sample.json
-export DEST_BUCKET=your-gcs-bucket   DEST_KEY=processed/sample.json
+# one-off transfer
+export SOURCE_BUCKET=my-bucket  SOURCE_KEY=incoming/file.json
+export DEST_BUCKET=my-gcs-bucket DEST_KEY=processed/file.json
 python src/worker.py
 
-# SQS queue mode (polls a real queue, routes failures to DLQ)
-export SQS_QUEUE_URL=https://sqs.ap-southeast-2.amazonaws.com/123456789/transfer-worker-queue
-export SQS_DLQ_URL=https://sqs.ap-southeast-2.amazonaws.com/123456789/transfer-worker-dlq
+# or point it at an SQS queue and it'll poll + process + delete
+export SQS_QUEUE_URL=https://sqs.ap-southeast-2.amazonaws.com/...
+export SQS_DLQ_URL=https://sqs.ap-southeast-2.amazonaws.com/...
 python src/worker.py
 ```
 
 ## Docker
 
 ```bash
-docker build -t transfer-worker .   # runs tests during the build
+docker build -t transfer-worker .   # tests run during the build
 docker run -e SOURCE_BUCKET=... -e DEST_BUCKET=... transfer-worker
 ```
 
-## CI pipeline
+Image gets pushed to ECR on every merge to main. ECR has scan-on-push enabled so AWS runs its own vulnerability check on top of the Trivy scan we do in CI.
 
-Three jobs chained together:
+## What the CI pipeline does
 
-1. **test-and-scan** -- pytest + Bandit SAST. No cloud creds needed.
-2. **docker-build** -- builds image, runs Trivy for container vulns.
-3. **transfer** -- authenticates to both clouds via OIDC/WIF, then:
-   - Seeds a test file in S3, transfers it to GCS via env vars, re-runs to prove idempotency.
-   - Creates real SQS queues (main + DLQ with redrive policy), sends 3 valid + 1 invalid message, polls via `SQS_QUEUE_URL`. Valid transfers land in GCS; the bad message gets routed to the DLQ.
-   - Prints SQS queue stats so you can cross-check in the AWS Console.
+Three jobs, each depends on the previous:
 
-## Example event
+**test-and-scan** — runs pytest and Bandit (SAST). Catches bugs and things like hardcoded secrets or unsafe eval calls.
+
+**docker-build** — builds the image, scans it with Trivy for CVEs, pushes to ECR.
+
+**transfer** — the interesting one. Logs into AWS via OIDC and GCP via WIF, then:
+- Puts a test file in S3, transfers it to GCS, runs again to show the idempotency skip
+- Spins up two SQS queues (main + DLQ with a redrive policy), sends 4 messages (3 good, 1 bad), polls them through the worker. Good ones get transferred and deleted, the bad one lands in the DLQ.
+- Dumps queue stats at the end so I can cross-check against the AWS console
+
+## Event format
 
 ```json
 {
@@ -63,35 +65,36 @@ Three jobs chained together:
 }
 ```
 
-## Auth approach
+## How auth works
 
-**AWS**: GitHub Actions OIDC token is exchanged for a short-lived STS session. The IAM role allows `s3:GetObject` + `s3:PutObject` on the bucket, plus SQS actions (`sqs:CreateQueue`, `sqs:SendMessage`, `sqs:ReceiveMessage`, `sqs:DeleteMessage`, `sqs:GetQueueAttributes`, `sqs:SetQueueAttributes`, `sqs:PurgeQueue`) scoped to `transfer-worker-*` queues. No access keys anywhere.
+**AWS** — GitHub's OIDC token gets exchanged for a short-lived STS session. The IAM role is scoped to one S3 bucket and queues named `transfer-worker-*`. No access keys stored anywhere.
 
-**GCP**: Same OIDC token goes through a Workload Identity Pool. The bound service account only has `storage.objectCreator` on one bucket -- it literally cannot read or delete anything. Tokens expire in an hour.
+**GCP** — Same OIDC token goes through Workload Identity Federation. The service account can write to one GCS bucket and that's it. Tokens expire in an hour.
 
-## SLOs
+## Things I'd do differently at scale
 
-- Transfer success rate: 99.5%
-- p95 latency: under 30 seconds
+- Swap the file-based DLQ for a proper SQS dead-letter queue (already demoed in CI but the worker also writes to a local file as a fallback)
+- Replace `blob.exists()` idempotency with DynamoDB or Redis if throughput gets high
+- Add Prometheus metrics instead of the JSON counters
+- Pin the base Docker image to a digest instead of just `3.12-slim`
 
-## Decisions worth calling out
+## Why I made certain choices
 
-- **WIF instead of static keys** -- credentials rotate automatically and expire in 1h.
-- **Exponential backoff with jitter** -- avoids thundering herd when a transient failure hits.
-- **Idempotency via GCS blob.exists()** -- simple and works. Could swap in Redis or DynamoDB if we needed it at scale.
-- **File-based DLQ + real SQS DLQ** -- file DLQ is a local log; in CI the workflow creates actual SQS queues with a redrive policy. The worker also does client-side routing (failed messages get sent to the DLQ queue immediately) so portal evidence is instant.
-- **Bandit + Trivy in CI** -- covers both source-level (hardcoded secrets, eval, SQL injection) and container-level (CVEs) scanning.
+**WIF over static keys** — tokens rotate automatically, expire in 1h, and I don't have to worry about key leaks.
 
-## Layout
+**Exponential backoff with jitter** — if S3 or GCS has a blip, retries spread out instead of all hitting at once.
+
+**Two layers of scanning** — Bandit catches Python-level stuff (eval, SQL injection patterns), Trivy catches OS/package CVEs in the container. ECR's scan-on-push adds a third layer on the AWS side.
+
+**SQS redrive policy** — after 2 failed receives, SQS automatically moves the message to the DLQ. The worker also does client-side routing for validation failures so the evidence shows up immediately.
+
+## Files
 
 ```
-src/
-  worker.py          core transfer logic, retry, idempotency, SQS polling, DLQ routing
-tests/
-  test_worker.py     16 tests covering validation, dedup, DLQ, happy path, SQS polling
-.github/workflows/
-  worker.yml         3-job CI pipeline with real SQS queues
-Dockerfile           multi-stage, non-root, healthcheck
-event_schema.json    event contract + compatibility notes
-ops_profile.json     logging/metrics/retry/identity config
+src/worker.py           transfer logic, retry, idempotency, SQS polling
+tests/test_worker.py    16 tests (validation, dedup, DLQ, SQS, happy path)
+.github/workflows/      CI pipeline — test, build, scan, deploy, transfer
+Dockerfile              multi-stage build, non-root user, healthcheck
+event_schema.json       event contract
+ops_profile.json        operational config (logging, retry, SLOs, identity)
 ```
