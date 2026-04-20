@@ -1,0 +1,86 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "CrossCloudTransferEvent",
+  "description": "Contract for cross-cloud file transfer events (AWS S3 -> GCP GCS)",
+  "type": "object",
+  "properties": {
+    "schemaVersion": {
+      "type": "string",
+      "enum": ["1.0", "1.1"],
+      "description": "Non-breaking additions via minor bump; breaking = new major"
+    },
+    "eventId": {
+      "type": "string",
+      "format": "uuid",
+      "description": "Unique event identifier"
+    },
+    "timestamp": {
+      "type": "string",
+      "format": "date-time",
+      "description": "ISO-8601 event creation time"
+    },
+    "correlationId": {
+      "type": "string",
+      "description": "Distributed trace ID for log correlation"
+    },
+    "idempotencyKey": {
+      "type": "string",
+      "description": "SHA-256 hash of source+destination+date for dedup"
+    },
+    "source": {
+      "type": "object",
+      "properties": {
+        "provider": { "type": "string", "enum": ["aws"] },
+        "bucket": { "type": "string", "minLength": 1 },
+        "key": { "type": "string", "minLength": 1 }
+      },
+      "required": ["provider", "bucket", "key"]
+    },
+    "destination": {
+      "type": "object",
+      "properties": {
+        "provider": { "type": "string", "enum": ["gcp"] },
+        "bucket": { "type": "string", "minLength": 1 },
+        "key": { "type": "string", "minLength": 1 }
+      },
+      "required": ["provider", "bucket", "key"]
+    },
+    "metadata": {
+      "type": "object",
+      "properties": {
+        "fileSizeBytes": { "type": "integer" },
+        "contentType": { "type": "string" }
+      },
+      "description": "Optional file metadata"
+    }
+  },
+  "required": ["schemaVersion", "eventId", "timestamp", "source", "destination", "idempotencyKey"],
+  "additionalProperties": false,
+  "_compatibility": {
+    "retries": "3 attempts with exponential backoff (2s base, 30s cap, jitter)",
+    "dlq": "Failed events routed to SQS DLQ (transfer-worker-dlq) + written to /tmp/dlq.json",
+    "versioning": "Minor bumps (1.0 -> 1.1) are non-breaking; new required fields = new major",
+    "deprecation": "Old versions supported for 90 days after new major release"
+  },
+  "_example": {
+    "schemaVersion": "1.0",
+    "eventId": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+    "timestamp": "2026-04-20T02:30:00Z",
+    "correlationId": "run-12345",
+    "idempotencyKey": "sha256-abc123def456",
+    "source": {
+      "provider": "aws",
+      "bucket": "vendor-data-exports",
+      "key": "incoming/2026-04-20/orders.csv"
+    },
+    "destination": {
+      "provider": "gcp",
+      "bucket": "megt-data-lake-raw",
+      "key": "processed/2026-04-20/orders.csv"
+    },
+    "metadata": {
+      "fileSizeBytes": 245760,
+      "contentType": "text/csv"
+    }
+  }
+}

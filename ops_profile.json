@@ -1,0 +1,74 @@
+{
+  "service": "cross-cloud-transfer-worker",
+  "runtime": "ECS Fargate / GitHub Actions",
+
+  "logging": {
+    "format": "structured JSON",
+    "fields": ["timestamp", "level", "message", "correlationId", "logger", "error"],
+    "destination": "stdout (CloudWatch in ECS, GitHub Actions logs in CI)"
+  },
+
+  "metrics": {
+    "counters": [
+      "events_received",
+      "events_processed",
+      "events_failed",
+      "events_skipped_duplicate",
+      "download_bytes"
+    ],
+    "note": "Emitted as JSON at end of each run. In production, push to Prometheus."
+  },
+
+  "health": {
+    "endpoint": "HEALTHCHECK in Dockerfile",
+    "interval": "30s",
+    "timeout": "5s",
+    "retries": 3
+  },
+
+  "retry": {
+    "maxAttempts": 3,
+    "baseDelay": "2s",
+    "maxDelay": "30s",
+    "strategy": "exponential backoff + full jitter",
+    "retryableErrors": ["ConnectionError", "OSError", "ClientError (transient)"],
+    "nonRetryable": ["validation errors", "unknown provider", "missing fields"]
+  },
+
+  "dlq": {
+    "sqsQueues": {
+      "main": "transfer-worker-queue",
+      "dlq": "transfer-worker-dlq",
+      "redriveMaxReceiveCount": 2,
+      "visibilityTimeout": "10s"
+    },
+    "fileFallback": "/tmp/dlq.json (local log of all failures)",
+    "retention": "14 days (SQS), indefinite (file)"
+  },
+
+  "identity": {
+    "aws": {
+      "method": "OIDC via GitHub Actions -> IAM Role",
+      "permissions": ["s3:GetObject", "s3:PutObject", "sqs:CreateQueue", "sqs:SendMessage", "sqs:ReceiveMessage", "sqs:DeleteMessage", "sqs:GetQueueAttributes", "sqs:SetQueueAttributes", "sqs:PurgeQueue"],
+      "noStaticKeys": true
+    },
+    "gcp": {
+      "method": "Workload Identity Federation (WIF)",
+      "permissions": ["storage.objectCreator (destination bucket only)"],
+      "noStaticKeys": true
+    }
+  },
+
+  "slos": [
+    {
+      "name": "Transfer Success Rate",
+      "target": "99.5%",
+      "measurement": "events_processed / events_received"
+    },
+    {
+      "name": "Transfer Latency (p95)",
+      "target": "< 30 seconds",
+      "measurement": "transfer_duration_seconds histogram"
+    }
+  ]
+}

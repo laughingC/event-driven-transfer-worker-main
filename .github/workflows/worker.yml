@@ -1,0 +1,236 @@
+name: cross-cloud-worker
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  test-and-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: install deps
+        run: pip install -r requirements.txt
+
+      - name: pytest
+        run: python -m pytest tests/ -v --tb=short --junitxml=test-results.xml
+
+      - name: bandit sast scan
+        run: |
+          pip install bandit
+          bandit -r src/ -f json -o bandit-report.json || true
+          bandit -r src/ -ll
+
+      - name: save reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-and-scan-reports
+          path: |
+            test-results.xml
+            bandit-report.json
+
+  docker-build:
+    runs-on: ubuntu-latest
+    needs: test-and-scan
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: docker build
+        run: docker build -t transfer-worker:${{ github.sha }} .
+
+      - name: trivy container scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: transfer-worker:${{ github.sha }}
+          format: table
+          severity: CRITICAL,HIGH
+          exit-code: 0
+
+  transfer:
+    runs-on: ubuntu-latest
+    needs: [test-and-scan, docker-build]
+    env:
+      RUN_TS: ""
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: install deps
+        run: pip install -r requirements.txt
+
+      - name: set timestamp for this run
+        run: echo "RUN_TS=$(date -u +%Y%m%d-%H%M%S)" >> $GITHUB_ENV
+
+      # ── AWS auth via OIDC (no static keys) ──
+      - name: aws oidc login
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ap-southeast-2
+
+      - name: prove aws identity
+        run: |
+          echo "--- AWS caller identity (proves OIDC worked) ---"
+          aws sts get-caller-identity
+          echo ""
+          echo "--- IAM role attached (check least-privilege in console) ---"
+          aws sts get-caller-identity --query 'Arn' --output text
+
+      # ── GCP auth via WIF (no static keys) ──
+      - name: gcp wif login
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WIF_PROVIDER }}
+          service_account: ${{ secrets.GCP_SA_EMAIL }}
+
+      # ── Seed a file in S3 (visible in AWS S3 console) ──
+      - name: upload test file to s3
+        run: |
+          echo '{"transfer_demo": true, "run": "${{ github.run_id }}", "ts": "'$RUN_TS'", "source": "github-actions"}' > /tmp/sample.json
+          aws s3 cp /tmp/sample.json s3://${{ vars.AWS_BUCKET }}/incoming/$RUN_TS-sample.json
+          echo ""
+          echo "--- S3 bucket contents (check AWS S3 console too) ---"
+          aws s3 ls s3://${{ vars.AWS_BUCKET }}/incoming/ --human-readable
+
+      # ── Run the worker: S3 -> GCS ──
+      - name: transfer s3 to gcs
+        env:
+          CORRELATION_ID: ${{ github.run_id }}
+          SOURCE_BUCKET: ${{ vars.AWS_BUCKET }}
+          SOURCE_KEY: "incoming/${{ env.RUN_TS }}-sample.json"
+          DEST_BUCKET: ${{ vars.GCP_BUCKET }}
+          DEST_KEY: "processed/${{ env.RUN_TS }}-sample.json"
+        run: python src/worker.py
+
+      # ── Run again with same key -- idempotency skip ──
+      - name: re-run same event (proves idempotency)
+        env:
+          CORRELATION_ID: ${{ github.run_id }}-idem
+          SOURCE_BUCKET: ${{ vars.AWS_BUCKET }}
+          SOURCE_KEY: "incoming/${{ env.RUN_TS }}-sample.json"
+          DEST_BUCKET: ${{ vars.GCP_BUCKET }}
+          DEST_KEY: "processed/${{ env.RUN_TS }}-sample.json"
+        run: python src/worker.py
+
+      # ── SQS queue demo (visible in AWS Console > SQS) ──
+      - name: create sqs queues (main + dlq)
+        run: |
+          DLQ_URL=$(aws sqs create-queue --queue-name transfer-worker-dlq \
+            --query 'QueueUrl' --output text)
+          DLQ_ARN=$(aws sqs get-queue-attributes --queue-url "$DLQ_URL" \
+            --attribute-names QueueArn --query 'Attributes.QueueArn' --output text)
+
+          QUEUE_URL=$(aws sqs create-queue --queue-name transfer-worker-queue \
+            --query 'QueueUrl' --output text)
+
+          # wire up redrive: after 2 failed receives, SQS moves the message to DLQ
+          aws sqs set-queue-attributes --queue-url "$QUEUE_URL" --attributes '{
+            "VisibilityTimeout": "10",
+            "MessageRetentionPeriod": "86400",
+            "RedrivePolicy": "{\"deadLetterTargetArn\":\"'"$DLQ_ARN"'\",\"maxReceiveCount\":\"2\"}"
+          }'
+
+          # clear leftovers from previous runs
+          aws sqs purge-queue --queue-url "$QUEUE_URL" 2>/dev/null || true
+          aws sqs purge-queue --queue-url "$DLQ_URL" 2>/dev/null || true
+
+          echo "QUEUE_URL=$QUEUE_URL" >> $GITHUB_ENV
+          echo "DLQ_URL=$DLQ_URL" >> $GITHUB_ENV
+          echo "DLQ_ARN=$DLQ_ARN" >> $GITHUB_ENV
+
+          echo "--- SQS queues ready ---"
+          echo "Main:  $QUEUE_URL"
+          echo "DLQ:   $DLQ_URL"
+
+      - name: seed s3 files and send sqs messages
+        run: |
+          for i in 1 2 3; do
+            echo '{"sqs_demo":true,"seq":'$i',"run":"${{ github.run_id }}"}' > /tmp/sqs-$i.json
+            aws s3 cp /tmp/sqs-$i.json \
+              "s3://${{ vars.AWS_BUCKET }}/incoming/sqs-${RUN_TS}-${i}.json"
+
+            BODY=$(cat <<ENDJSON
+          {"eventId":"sqs-${RUN_TS}-${i}","schemaVersion":"1.0","timestamp":"$(date -u +%Y-%m-%dT%H:%M:%SZ)","correlationId":"sqs-${{ github.run_id }}","idempotencyKey":"sqs-${RUN_TS}-${i}","source":{"provider":"aws","bucket":"${{ vars.AWS_BUCKET }}","key":"incoming/sqs-${RUN_TS}-${i}.json"},"destination":{"provider":"gcp","bucket":"${{ vars.GCP_BUCKET }}","key":"processed/sqs-${RUN_TS}-${i}.json"}}
+          ENDJSON
+          )
+            aws sqs send-message --queue-url "$QUEUE_URL" --message-body "$BODY"
+          done
+
+          # one bad message: source provider "azure" will fail validation -> DLQ
+          BAD=$(cat <<ENDJSON
+          {"eventId":"sqs-bad-${RUN_TS}","schemaVersion":"1.0","timestamp":"$(date -u +%Y-%m-%dT%H:%M:%SZ)","correlationId":"sqs-bad","idempotencyKey":"sqs-bad-${RUN_TS}","source":{"provider":"azure","bucket":"nope","key":"bad.json"},"destination":{"provider":"gcp","bucket":"${{ vars.GCP_BUCKET }}","key":"processed/bad.json"}}
+          ENDJSON
+          )
+          aws sqs send-message --queue-url "$QUEUE_URL" --message-body "$BAD"
+
+          echo "Sent 3 valid + 1 invalid messages to SQS"
+          aws sqs get-queue-attributes --queue-url "$QUEUE_URL" \
+            --attribute-names ApproximateNumberOfMessages --output table
+
+      - name: worker polls sqs queue
+        env:
+          SQS_QUEUE_URL: ${{ env.QUEUE_URL }}
+          SQS_DLQ_URL: ${{ env.DLQ_URL }}
+          CORRELATION_ID: sqs-${{ github.run_id }}
+        run: python src/worker.py
+
+      - name: sqs queue stats (check AWS Console > SQS)
+        run: |
+          echo "=== MAIN QUEUE (transfer-worker-queue) ==="
+          aws sqs get-queue-attributes --queue-url "$QUEUE_URL" \
+            --attribute-names ApproximateNumberOfMessages ApproximateNumberOfMessagesNotVisible \
+            --output table
+
+          echo ""
+          echo "=== DEAD LETTER QUEUE (transfer-worker-dlq) ==="
+          aws sqs get-queue-attributes --queue-url "$DLQ_URL" \
+            --attribute-names ApproximateNumberOfMessages ApproximateNumberOfMessagesNotVisible \
+            --output table
+
+          echo ""
+          echo "Open AWS Console > SQS > ap-southeast-2 to see these queues"
+          echo "Click 'Poll for messages' on the DLQ to see the failed event"
+
+      # ── Verify on GCS (visible in GCP GCS console) ──
+      - name: verify files in gcs
+        run: |
+          python -c "
+          from google.cloud import storage
+          c = storage.Client()
+          bucket = c.bucket('${{ vars.GCP_BUCKET }}')
+
+          print('--- GCS transferred files (check GCP console too) ---')
+          blobs = list(bucket.list_blobs(prefix='processed/'))
+          for b in blobs:
+              print(f'  gs://${{ vars.GCP_BUCKET }}/{b.name}  size={b.size}  updated={b.updated}')
+          print(f'Total objects in processed/: {len(blobs)}')
+          "
+
+      - name: final s3 listing
+        run: |
+          echo "--- S3 incoming/ (all seeded test files) ---"
+          aws s3 ls s3://${{ vars.AWS_BUCKET }}/incoming/ --human-readable
+
+      - name: save dlq artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dlq-report
+          path: /tmp/dlq.json
+          if-no-files-found: ignore
